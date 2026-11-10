@@ -1,0 +1,2105 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+import json
+import math
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+from PyQt6.QtCore import (QBuffer, QByteArray, QIODevice, QPoint, QRect, QSize,
+                          Qt, QTimer, pyqtSignal)
+from PyQt6.QtGui import (QAction, QColor, QGuiApplication, QIcon, QImage,
+                         QImageReader, QKeySequence, QLinearGradient, QPainter,
+                         QPen, QPixmap, QShortcut)
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
+                             QFrame, QHBoxLayout, QInputDialog, QLabel,
+                             QLineEdit, QListWidget, QListWidgetItem,
+                             QMainWindow, QMenu, QMessageBox, QPushButton,
+                             QScrollArea, QSlider, QSpinBox, QSystemTrayIcon,
+                             QVBoxLayout, QWidget)
+
+APP_NAME = "CrosshairX"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "crosshairx"
+PRESETS_DIR = CONFIG_DIR / "presets"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
+AUTOSTART_FILE = Path.home() / ".config" / "autostart" / "crosshairx.desktop"
+
+QSS = """
+* { font-family: "Noto Sans", "Inter", sans-serif; font-size: 14px; }
+QWidget#Root, QMainWindow { background: #1b2735; color: #d6dee8; }
+QWidget#Sidebar { background: #16202c; border-right: 1px solid #22303f; }
+QFrame#Panel { background: #16202c; border: 1px solid #22303f; border-radius: 8px; }
+QScrollArea#Panel { background: #16202c; border: 1px solid #22303f; border-radius: 8px; }
+QScrollArea#Panel > QWidget > QWidget { background: transparent; }
+QScrollArea#Panel > QWidget#qt_scrollarea_viewport { background: transparent; }
+QLabel { color: #d6dee8; background: transparent; }
+QLabel#Title { font-size: 19px; font-weight: 600; color: #eaf1f8; }
+QLabel#Hint { color: #7d8fa3; font-size: 12px; }
+QLabel#Section { color: #7d8fa3; font-size: 12px; }
+
+QPushButton {
+    background: #22303f; color: #d6dee8; border: 1px solid #2b3c4e;
+    border-radius: 6px; padding: 8px 14px;
+}
+QPushButton:hover { background: #2a3c4f; }
+QPushButton:pressed { background: #1f2c3a; }
+QPushButton:checked { background: #2b6cb3; border-color: #3daee9; color: #ffffff; }
+QPushButton#Primary {
+    background: #2b6cb3; border: 1px solid #3daee9; color: #ffffff;
+    font-weight: 600; padding: 11px 16px;
+}
+QPushButton#Primary:hover { background: #3178c4; }
+QPushButton#Danger:hover { background: #7a2f35; border-color: #a13d45; }
+
+QLineEdit, QSpinBox, QComboBox {
+    background: #101a24; color: #d6dee8; border: 1px solid #2b3c4e;
+    border-radius: 6px; padding: 6px 8px; selection-background-color: #2b6cb3;
+}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: #3daee9; }
+QComboBox QAbstractItemView {
+    background: #16202c; color: #d6dee8; border: 1px solid #2b3c4e;
+    selection-background-color: #2b6cb3; outline: none;
+}
+
+QListWidget { background: #16202c; border: none; outline: none; padding: 6px; }
+QListWidget::item { color: #d6dee8; padding: 8px; border-radius: 6px; margin-bottom: 2px; }
+QListWidget::item:hover { background: #1f2c3a; }
+QListWidget::item:selected { background: #2b6cb3; color: #ffffff; }
+
+QScrollBar:vertical { background: transparent; width: 10px; margin: 4px 2px; }
+QScrollBar::handle:vertical { background: #2b3c4e; border-radius: 5px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: #3a5069; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+QCheckBox { color: #d6dee8; spacing: 8px; background: transparent; }
+QCheckBox::indicator {
+    width: 16px; height: 16px; border-radius: 4px;
+    border: 1px solid #2b3c4e; background: #101a24;
+}
+QCheckBox::indicator:checked { background: #3daee9; border-color: #3daee9; }
+
+QSlider::groove:horizontal { height: 6px; background: #101a24; border-radius: 3px; }
+QSlider::handle:horizontal {
+    width: 14px; margin: -5px 0; border-radius: 7px;
+    background: #d6dee8; border: 1px solid #2b3c4e;
+}
+QToolTip { background: #101a24; color: #d6dee8; border: 1px solid #2b3c4e; padding: 4px; }
+"""
+
+
+def safe_filename(name):
+    s = re.sub(r"[^\w\-. ]+", "_", name, flags=re.UNICODE).strip()
+    return s or "preset"
+
+
+def screen_at(index):
+    screens = QGuiApplication.screens()
+    if 0 <= index < len(screens):
+        return screens[index]
+    return QGuiApplication.primaryScreen()
+
+
+def screen_pixel_size(index=0):
+    scr = screen_at(index)
+    g = scr.geometry()
+    dpr = scr.devicePixelRatio()
+    return int(round(g.width() * dpr)), int(round(g.height() * dpr))
+
+
+def blank_image(width, height):
+    img = QImage(width, height, QImage.Format.Format_ARGB32)
+    img.fill(Qt.GlobalColor.transparent)
+    return img
+
+
+def image_to_base64(img):
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "PNG")
+    buf.close()
+    return bytes(ba.toBase64()).decode("ascii")
+
+
+def image_from_base64(text):
+    ba = QByteArray.fromBase64(QByteArray(text.encode("ascii")))
+    img = QImage.fromData(ba, "PNG")
+    if img.isNull():
+        return None
+    return img.convertToFormat(QImage.Format.Format_ARGB32)
+
+
+def image_to_png_bytes(img):
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "PNG")
+    buf.close()
+    return ba
+
+
+def image_from_png_bytes(ba):
+    img = QImage.fromData(ba, "PNG")
+    return img.convertToFormat(QImage.Format.Format_ARGB32)
+
+
+def load_frames(path):
+    """Decode an image file into (frames, delays_ms). Works for plain
+    images (single frame, delay 0) and animated GIF/WebP (one entry per
+    frame, delay taken from the file, falling back to 80ms)."""
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    frames = []
+    delays = []
+    img = reader.read()
+    if img.isNull():
+        img = QImage(path)
+        if img.isNull():
+            return [], []
+        return [img.convertToFormat(QImage.Format.Format_ARGB32)], [0]
+    frames.append(img.convertToFormat(QImage.Format.Format_ARGB32))
+    d = reader.nextImageDelay()
+    delays.append(d if d > 0 else 80)
+    while reader.canRead() and len(frames) < 500:
+        img = reader.read()
+        if img.isNull():
+            break
+        frames.append(img.convertToFormat(QImage.Format.Format_ARGB32))
+        d = reader.nextImageDelay()
+        delays.append(d if d > 0 else 80)
+    if len(frames) == 1:
+        delays = [0]
+    return frames, delays
+
+
+def bresenham(x0, y0, x1, y1):
+    pts = []
+    dx, dy = abs(x1 - x0), -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    while True:
+        pts.append((x0, y0))
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+    return pts
+
+
+def rect_points(x0, y0, x1, y1, filled):
+    left, right = sorted((x0, x1))
+    top, bottom = sorted((y0, y1))
+    if filled:
+        return {(x, y) for y in range(top, bottom + 1) for x in range(left, right + 1)}
+    pts = set()
+    for x in range(left, right + 1):
+        pts.add((x, top))
+        pts.add((x, bottom))
+    for y in range(top, bottom + 1):
+        pts.add((left, y))
+        pts.add((right, y))
+    return pts
+
+
+def ellipse_points(x0, y0, x1, y1, filled):
+    left, right = sorted((x0, x1))
+    top, bottom = sorted((y0, y1))
+    cx, cy = (left + right) / 2.0, (top + bottom) / 2.0
+    rx, ry = max((right - left) / 2.0, 0.5), max((bottom - top) / 2.0, 0.5)
+    inside = set()
+    for y in range(top, bottom + 1):
+        for x in range(left, right + 1):
+            dx, dy = (x - cx) / rx, (y - cy) / ry
+            if dx * dx + dy * dy <= 1.0:
+                inside.add((x, y))
+    if filled:
+        return inside
+    return {(x, y) for (x, y) in inside
+            if any((x + a, y + b) not in inside for a, b in ((1, 0), (-1, 0), (0, 1), (0, -1)))}
+
+
+def make_app_icon():
+    pm = QPixmap(64, 64)
+    pm.fill(QColor(22, 32, 44))
+    p = QPainter(pm)
+    p.setPen(QColor(61, 174, 233))
+    p.drawLine(32, 8, 32, 24)
+    p.drawLine(32, 40, 32, 56)
+    p.drawLine(8, 32, 24, 32)
+    p.drawLine(40, 32, 56, 32)
+    p.fillRect(30, 30, 4, 4, QColor(255, 255, 255))
+    p.end()
+    return QIcon(pm)
+
+
+class Layer:
+
+    def __init__(self, name, frames, delays, pos=None, scale=1.0, opacity=255):
+        self.name = name
+        self.frames = frames
+        self.delays = delays
+        self.pos = pos if pos is not None else QPoint(0, 0)
+        self.scale = scale
+        self.opacity = opacity
+        self.frame_index = 0
+        self._elapsed = 0
+
+    @property
+    def is_animated(self):
+        return len(self.frames) > 1
+
+    def copy(self):
+        l = Layer(self.name, self.frames, self.delays, QPoint(self.pos), self.scale, self.opacity)
+        l.frame_index = self.frame_index
+        return l
+
+    def base_frame(self, index=None):
+        i = self.frame_index if index is None else index
+        return self.frames[i % len(self.frames)]
+
+    def scaled_frame(self, index=None):
+        img = self.base_frame(index)
+        w = max(1, int(round(img.width() * self.scale)))
+        h = max(1, int(round(img.height() * self.scale)))
+        if (w, h) == (img.width(), img.height()):
+            return img
+        return img.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                          Qt.TransformationMode.SmoothTransformation)
+
+    def advance(self, dt_ms):
+        if not self.is_animated:
+            return False
+        self._elapsed += dt_ms
+        changed = False
+        guard = 0
+        while self._elapsed >= self.delays[self.frame_index] and guard < 8:
+            d = self.delays[self.frame_index] or 80
+            self._elapsed -= d
+            self.frame_index = (self.frame_index + 1) % len(self.frames)
+            changed = True
+            guard += 1
+        return changed
+
+    def to_dict(self):
+        return {"name": self.name, "pos": [self.pos.x(), self.pos.y()],
+                "scale": self.scale, "opacity": self.opacity,
+                "delays": list(self.delays),
+                "frames": [image_to_base64(f) for f in self.frames]}
+
+    @staticmethod
+    def from_dict(d):
+        frames = []
+        for b64 in d.get("frames", []):
+            img = image_from_base64(b64)
+            if img is not None:
+                frames.append(img)
+        if not frames:
+            return None
+        delays = d.get("delays") or []
+        if len(delays) != len(frames):
+            delays = (list(delays) + [80] * len(frames))[:len(frames)]
+        pos = d.get("pos", [0, 0])
+        return Layer(d.get("name", "layer"), frames, delays,
+                    pos=QPoint(int(pos[0]), int(pos[1])),
+                    scale=float(d.get("scale", 1.0)),
+                    opacity=int(d.get("opacity", 255)))
+
+
+class Preset:
+    def __init__(self, name, image=None, width=None, height=None, layers=None):
+        self.name = name
+        if image is None:
+            if width is None or height is None:
+                width, height = screen_pixel_size(0)
+            image = blank_image(width, height)
+        self.image = image
+        self.layers = layers if layers is not None else []
+
+    @property
+    def width(self):
+        return self.image.width()
+
+    @property
+    def height(self):
+        return self.image.height()
+
+    @property
+    def path(self):
+        return PRESETS_DIR / (safe_filename(self.name) + ".json")
+
+    def copy(self):
+        return Preset(self.name, image=self.image.copy(),
+                      layers=[l.copy() for l in self.layers])
+
+    def composite_image(self):
+
+        if not self.layers:
+            return self.image
+        img = self.image.copy()
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        for layer in self.layers:
+            p.setOpacity(layer.opacity / 255.0)
+            p.drawImage(layer.pos, layer.scaled_frame())
+        p.end()
+        return img
+
+    def to_dict(self):
+        d = {"version": 3, "name": self.name, "width": self.width,
+             "height": self.height, "png": image_to_base64(self.image)}
+        if self.layers:
+            d["layers"] = [l.to_dict() for l in self.layers]
+        return d
+
+    @staticmethod
+    def from_dict(d):
+        name = d.get("name", "preset")
+        if "png" in d:
+            img = image_from_base64(d["png"])
+            if img is None:
+                img = blank_image(*screen_pixel_size(0))
+            preset = Preset(name, image=img)
+        else:
+            size = int(d.get("size", 65))
+            img = blank_image(size, size)
+            for key, hexcol in d.get("pixels", {}).items():
+                try:
+                    x, y = (int(v) for v in key.split(","))
+                except ValueError:
+                    continue
+                if 0 <= x < size and 0 <= y < size:
+                    h = hexcol.lstrip("#")
+                    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+                    a = int(h[6:8], 16) if len(h) >= 8 else 255
+                    img.setPixelColor(x, y, QColor(r, g, b, a))
+            preset = Preset(name, image=img)
+        layers = []
+        for ld in d.get("layers", []):
+            try:
+                layer = Layer.from_dict(ld)
+            except Exception:
+                layer = None
+            if layer is not None:
+                layers.append(layer)
+        preset.layers = layers
+        return preset
+
+    def save(self):
+        PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def delete_file(self):
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def content_rect(self):
+        if getattr(self, "_crect", None) is not None:
+            return QRect(self._crect)
+        img = self.composite_image()
+        w, h = img.width(), img.height()
+        k = max(1, int(math.ceil(max(w, h) / 220.0)))
+        small = img.scaled(max(1, w // k), max(1, h // k),
+                           Qt.AspectRatioMode.IgnoreAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+        sw, sh = small.width(), small.height()
+        minx, miny, maxx, maxy = sw, sh, -1, -1
+        try:
+            ptr = small.bits()
+            ptr.setsize(small.sizeInBytes())
+            mv = memoryview(ptr).cast("I")
+            stride = small.bytesPerLine() // 4
+            for y in range(sh):
+                row = y * stride
+                for x in range(sw):
+                    if mv[row + x] >> 24:
+                        if x < minx:
+                            minx = x
+                        if x > maxx:
+                            maxx = x
+                        if y < miny:
+                            miny = y
+                        if y > maxy:
+                            maxy = y
+        except Exception:
+            self._crect = QRect(0, 0, w, h)
+            return QRect(self._crect)
+        if maxx < 0:
+            self._crect = QRect(0, 0, w, h)
+        else:
+            r = QRect(minx * k - k, miny * k - k, (maxx - minx + 3) * k, (maxy - miny + 3) * k)
+            self._crect = r.intersected(QRect(0, 0, w, h))
+        return QRect(self._crect)
+
+    def thumbnail(self, box=44):
+        pm = QPixmap(box, box)
+        pm.fill(Qt.GlobalColor.transparent)
+        src = self.composite_image()
+        r = self.content_rect()
+        pad = max(4, max(r.width(), r.height()) // 12)
+        r = r.adjusted(-pad, -pad, pad, pad).intersected(QRect(0, 0, src.width(), src.height()))
+        scale = min(box / max(r.width(), 1), box / max(r.height(), 1))
+        w = max(1, int(r.width() * scale))
+        h = max(1, int(r.height() * scale))
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, scale < 1)
+        p.drawImage(QRect((box - w) // 2, (box - h) // 2, w, h), src, r)
+        p.end()
+        return pm
+
+
+def load_presets():
+    PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    out = []
+    for f in sorted(PRESETS_DIR.glob("*.json")):
+        try:
+            out.append(Preset.from_dict(json.loads(f.read_text(encoding="utf-8"))))
+        except Exception as e:
+            print("Failed to read %s: %s" % (f, e), file=sys.stderr)
+    return out
+
+
+def create_default_presets():
+    w, h = screen_pixel_size(0)
+    cx, cy = w // 2, h // 2
+    green = QColor(0, 255, 0, 255)
+    cyan = QColor(61, 174, 233, 255)
+
+    dot = Preset("Dot")
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            dot.image.setPixelColor(cx + dx, cy + dy, green)
+
+    cross = Preset("Cross")
+    for i in range(4, 13):
+        cross.image.setPixelColor(cx + i, cy, green)
+        cross.image.setPixelColor(cx - i, cy, green)
+        cross.image.setPixelColor(cx, cy + i, green)
+        cross.image.setPixelColor(cx, cy - i, green)
+
+    tcross = Preset("T-shape")
+    for i in range(3, 14):
+        tcross.image.setPixelColor(cx + i, cy, cyan)
+        tcross.image.setPixelColor(cx - i, cy, cyan)
+        tcross.image.setPixelColor(cx, cy + i, cyan)
+    tcross.image.setPixelColor(cx, cy, cyan)
+
+    for p in (dot, cross, tcross):
+        p.save()
+
+
+def load_settings():
+    defaults = {"last_preset": "", "start_overlay": False, "autostart": False,
+                "screen": 0, "bypass_wm": True}
+    try:
+        defaults.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+    return defaults
+
+
+def save_settings(s):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def set_autostart(enabled):
+    AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if enabled:
+        script = Path(__file__).resolve()
+        AUTOSTART_FILE.write_text(
+            "[Desktop Entry]\nType=Application\nName=CrosshairX\n"
+            'Exec="%s" "%s" --tray --start\n'
+            "Icon=applications-games\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+            % (sys.executable, script), encoding="utf-8")
+    else:
+        try:
+            AUTOSTART_FILE.unlink()
+        except FileNotFoundError:
+            pass
+
+
+class Overlay(QWidget):
+    def __init__(self, bypass_wm=True):
+        super().__init__(None)
+        self._platform = QGuiApplication.platformName()
+        self._is_x11 = self._platform == "xcb"
+        flags = (Qt.WindowType.FramelessWindowHint
+                 | Qt.WindowType.WindowStaysOnTopHint
+                 | Qt.WindowType.Tool
+                 | Qt.WindowType.WindowTransparentForInput
+                 | Qt.WindowType.WindowDoesNotAcceptFocus)
+        if self._is_x11:
+            flags |= Qt.WindowType.X11BypassWindowManagerHint
+        self.setWindowFlags(flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setWindowTitle("CrosshairX Overlay")
+        self.preset = None
+        self._wmctrl = shutil.which("wmctrl")
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._keep_on_top)
+        self._timer.setInterval(400)
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(33)
+        self._anim_timer.timeout.connect(self._advance_layers)
+
+    def _advance_layers(self):
+        if self.preset is None:
+            return
+        changed = False
+        for layer in self.preset.layers:
+            if layer.advance(self._anim_timer.interval()):
+                changed = True
+        if changed:
+            self.update()
+
+    def _keep_on_top(self):
+        if not self.isVisible():
+            return
+        self.raise_()
+        if self._wmctrl and self._is_x11:
+            try:
+                subprocess.Popen(
+                    ["wmctrl", "-r", "CrosshairX Overlay", "-b", "add,above,sticky"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+    def show_preset(self, preset, screen_index=0):
+        if preset is None:
+            return
+        self.preset = preset
+        self.setGeometry(screen_at(screen_index).geometry())
+        self.show()
+        self.raise_()
+        self._timer.start()
+        if any(l.is_animated for l in preset.layers):
+            self._anim_timer.start()
+        else:
+            self._anim_timer.stop()
+        self.update()
+
+    def stop(self):
+        self._timer.stop()
+        self._anim_timer.stop()
+        self.hide()
+
+    def paintEvent(self, _):
+        if self.preset is None:
+            return
+        dpr = self.devicePixelRatioF()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.scale(1.0 / dpr, 1.0 / dpr)
+        w = int(round(self.width() * dpr))
+        h = int(round(self.height() * dpr))
+        img = self.preset.image
+        ox = (w - img.width()) // 2
+        oy = (h - img.height()) // 2
+        p.drawImage(QPoint(ox, oy), img)
+        if self.preset.layers:
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            for layer in self.preset.layers:
+                p.setOpacity(layer.opacity / 255.0)
+                p.drawImage(QPoint(ox + layer.pos.x(), oy + layer.pos.y()), layer.scaled_frame())
+            p.setOpacity(1.0)
+        p.end()
+
+
+class ColorPicker(QWidget):
+    colorChanged = pyqtSignal(QColor)
+
+    def __init__(self):
+        super().__init__()
+        self.r = 0
+        self.g = 255
+        self.b = 0
+        self.sat = 255
+        self.a = 255
+        self._lock = False
+        self.sliders = {}
+        self.value_labels = {}
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+
+        for key, title, maxval, default in (
+                ("r", "R", 255, self.r), ("g", "G", 255, self.g),
+                ("b", "B", 255, self.b), ("sat", "Saturation", 255, self.sat),
+                ("a", "Alpha", 255, self.a)):
+            block = QVBoxLayout()
+            block.setSpacing(3)
+            head = QHBoxLayout()
+            lbl = QLabel(title)
+            val = QLabel(str(default))
+            val.setObjectName("Hint")
+            head.addWidget(lbl)
+            head.addStretch(1)
+            head.addWidget(val)
+            block.addLayout(head)
+            sld = QSlider(Qt.Orientation.Horizontal)
+            sld.setRange(0, maxval)
+            sld.setValue(default)
+            sld.valueChanged.connect(lambda v, k=key: self._on_channel(k, v))
+            block.addWidget(sld)
+            lay.addLayout(block)
+            self.sliders[key] = sld
+            self.value_labels[key] = val
+
+        hexrow = QHBoxLayout()
+        self.swatch = QLabel()
+        self.swatch.setFixedSize(30, 28)
+        self.hexedit = QLineEdit()
+        self.hexedit.setPlaceholderText("#00ff00ff")
+        self.hexedit.returnPressed.connect(self._on_hex)
+        hexrow.addWidget(self.swatch)
+        hexrow.addWidget(self.hexedit, 1)
+        lay.addLayout(hexrow)
+
+        quickrow = QHBoxLayout()
+        b_black = QPushButton("Black")
+        b_black.clicked.connect(lambda: self._set_rgb(0, 0, 0))
+        b_white = QPushButton("White")
+        b_white.clicked.connect(lambda: self._set_rgb(255, 255, 255))
+        quickrow.addWidget(b_black)
+        quickrow.addWidget(b_white)
+        lay.addLayout(quickrow)
+
+        self._refresh()
+
+    def color(self):
+        return self._final_color()
+
+    def _final_color(self):
+        r, g, b = self.r, self.g, self.b
+        gray = 0.299 * r + 0.587 * g + 0.114 * b
+        t = self.sat / 255.0
+        fr = int(round(max(0, min(255, gray + (r - gray) * t))))
+        fg = int(round(max(0, min(255, gray + (g - gray) * t))))
+        fb = int(round(max(0, min(255, gray + (b - gray) * t))))
+        return QColor(fr, fg, fb, self.a)
+
+    def _set_rgb(self, r, g, b):
+        self.r, self.g, self.b = r, g, b
+        self.sat = 255
+        self._refresh()
+        self.colorChanged.emit(self._final_color())
+
+    def set_color(self, c):
+        self.r, self.g, self.b, self.a = c.red(), c.green(), c.blue(), c.alpha()
+        self.sat = 255
+        self._refresh()
+        self.colorChanged.emit(self._final_color())
+
+    def _refresh(self):
+        self._lock = True
+        for key, val in (("r", self.r), ("g", self.g), ("b", self.b),
+                         ("sat", self.sat), ("a", self.a)):
+            self.sliders[key].setValue(val)
+            self.value_labels[key].setText(str(val))
+        c = self._final_color()
+        self.hexedit.setText("#%02x%02x%02x%02x" % (c.red(), c.green(), c.blue(), c.alpha()))
+        pm = QPixmap(self.swatch.size())
+        pm.fill(QColor(16, 26, 36))
+        p = QPainter(pm)
+        p.fillRect(pm.rect().adjusted(1, 1, -1, -1), c)
+        p.setPen(QColor(43, 60, 78))
+        p.drawRect(pm.rect().adjusted(0, 0, -1, -1))
+        p.end()
+        self.swatch.setPixmap(pm)
+        self._lock = False
+
+    def _on_channel(self, key, val):
+        if self._lock:
+            return
+        setattr(self, key, val)
+        self._refresh()
+        self.colorChanged.emit(self._final_color())
+
+    def _on_hex(self):
+        t = self.hexedit.text().strip().lstrip("#")
+        try:
+            if len(t) == 6:
+                t += "ff"
+            r, g, b, a = (int(t[i:i + 2], 16) for i in (0, 2, 4, 6))
+            self.set_color(QColor(r, g, b, a))
+        except Exception:
+            self._refresh()
+# v5 --------------------------------------------------- 10.09.26
+
+class Editor(QWidget):
+    saved = pyqtSignal(object)
+    closed = pyqtSignal()
+
+    TOOLS = [("pencil", "Pencil"), ("eraser", "Eraser"), ("line", "Line"),
+             ("rect", "Rectangle"), ("ellipse", "Ellipse"), ("fill", "Fill"),
+             ("picker", "Picker"), ("move", "Move layer")]
+
+    def __init__(self, preset, screen_index=0):
+        super().__init__(None)
+        self.setObjectName("Root")
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet(QSS)
+        self.setMouseTracking(True)
+
+        self.preset = preset.copy()
+        self.image = self.preset.image
+        self.orig_name = preset.name
+        self.screen_index = screen_index
+
+        self.tool = "pencil"
+        self.thickness = 1
+        self.zoom = 1
+        self.ox = 0
+        self.oy = 0
+        self.show_grid = True
+        self.fill_shapes = False
+        self.dim = 150
+        self.color = QColor(0, 255, 0, 255)
+        self.dirty = False
+
+        self.undo_stack = []
+        self.redo_stack = []
+        self.drag_start = None
+        self.snapshot = None
+        self.last_pt = None
+        self.hover = None
+        self.panning = False
+        self.pan_anchor = None
+
+        self.layers = self.preset.layers
+        self.active_layer = self.layers[0] if self.layers else None
+        self.layer_dragging = False
+        self.layer_resizing = False
+        self.layer_drag_anchor = None
+        self.layer_drag_orig_pos = None
+        self.layer_resize_start = None
+        self.layer_resize_orig_scale = 1.0
+
+        self._build_ui()
+        self._install_shortcuts()
+        self.setGeometry(screen_at(screen_index).geometry())
+        QTimer.singleShot(0, self.center_canvas)
+
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(50)
+        self._anim_timer.timeout.connect(self._advance_layer_anim)
+        self._anim_timer.start()
+
+    def _advance_layer_anim(self):
+        changed = False
+        for layer in self.layers:
+            if layer.advance(self._anim_timer.interval()):
+                changed = True
+        if changed:
+            self.update()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+
+        self.top_panel = QFrame()
+        self.top_panel.setObjectName("Panel")
+        tl = QHBoxLayout(self.top_panel)
+        tl.setContentsMargins(14, 10, 14, 10)
+        tl.setSpacing(10)
+        title = QLabel("Crosshair editor")
+        title.setObjectName("Title")
+        self.name_edit = QLineEdit(self.preset.name)
+        self.name_edit.setFixedWidth(200)
+        b_load = QPushButton("Load")
+        b_load.clicked.connect(self.load_dialog)
+        b_png = QPushButton("Import image")
+        b_png.clicked.connect(self.import_image)
+        b_save_as = QPushButton("Save as")
+        b_save_as.clicked.connect(self.save_as)
+        b_save = QPushButton("Save")
+        b_save.setObjectName("Primary")
+        b_save.clicked.connect(self.save)
+        b_hide = QPushButton("Hide panels")
+        b_hide.clicked.connect(self.toggle_panels)
+        b_close = QPushButton("Close")
+        b_close.clicked.connect(self.close)
+        tl.addWidget(title)
+        tl.addSpacing(10)
+        tl.addWidget(QLabel("Name"))
+        tl.addWidget(self.name_edit)
+        tl.addStretch(1)
+        for b in (b_hide, b_load, b_png, b_save_as, b_save, b_close):
+            tl.addWidget(b)
+        root.addWidget(self.top_panel)
+
+        mid = QHBoxLayout()
+        mid.setSpacing(12)
+        tools_content = self._build_tools()
+        self.tools_panel = QScrollArea()
+        self.tools_panel.setObjectName("Panel")
+        self.tools_panel.setWidget(tools_content)
+        self.tools_panel.setWidgetResizable(True)
+        self.tools_panel.setFixedWidth(266)
+        self.tools_panel.setFrameShape(QFrame.Shape.NoFrame)
+        self.tools_panel.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tools_panel.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tools_panel.viewport().setAutoFillBackground(False)
+        mid.addWidget(self.tools_panel)
+        mid.addStretch(1)
+        root.addLayout(mid, 1)
+
+        self.status = QLabel("")
+        self.status.setObjectName("Hint")
+        root.addWidget(self.status, 0, Qt.AlignmentFlag.AlignHCenter)
+
+    def _build_tools(self):
+        panel = QFrame()
+        panel.setFixedWidth(250)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(9)
+
+        lay.addWidget(self._section("Tools"))
+        grid = QVBoxLayout()
+        grid.setSpacing(4)
+        self.tool_buttons = {}
+        row = None
+        for i, (key, label) in enumerate(self.TOOLS):
+            if i % 2 == 0:
+                row = QHBoxLayout()
+                row.setSpacing(4)
+                grid.addLayout(row)
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setChecked(key == self.tool)
+            b.clicked.connect(lambda _, k=key: self.set_tool(k))
+            row.addWidget(b)
+            self.tool_buttons[key] = b
+        lay.addLayout(grid)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Thickness"))
+        self.thick_spin = QSpinBox()
+        self.thick_spin.setRange(1, 200)
+        self.thick_spin.setValue(1)
+        self.thick_spin.setSuffix(" px")
+        self.thick_spin.valueChanged.connect(lambda v: setattr(self, "thickness", v))
+        row.addStretch(1)
+        row.addWidget(self.thick_spin)
+        lay.addLayout(row)
+
+        self.chk_fill = QCheckBox("Fill shapes")
+        self.chk_fill.toggled.connect(lambda v: setattr(self, "fill_shapes", v))
+        lay.addWidget(self.chk_fill)
+
+        lay.addWidget(self._section("Color"))
+        self.picker = ColorPicker()
+        self.picker.colorChanged.connect(self._on_color)
+        self.picker.set_color(self.color)
+        lay.addWidget(self.picker)
+
+        lay.addWidget(self._section("View"))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Zoom"))
+        self.zoom_spin = QSpinBox()
+        self.zoom_spin.setRange(1, 40)
+        self.zoom_spin.setValue(self.zoom)
+        self.zoom_spin.setSuffix(" x")
+        self.zoom_spin.valueChanged.connect(self._on_zoom_spin)
+        row.addStretch(1)
+        row.addWidget(self.zoom_spin)
+        lay.addLayout(row)
+
+        b_center = QPushButton("Center")
+        b_center.setObjectName("Primary")
+        b_center.clicked.connect(self.center_canvas)
+        lay.addWidget(b_center)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Dim"))
+        self.dim_slider = QSlider(Qt.Orientation.Horizontal)
+        self.dim_slider.setRange(0, 245)
+        self.dim_slider.setValue(self.dim)
+        self.dim_slider.valueChanged.connect(lambda v: (setattr(self, "dim", v), self.update()))
+        row.addWidget(self.dim_slider, 1)
+        lay.addLayout(row)
+
+        chk_grid = QCheckBox("Pixel grid")
+        chk_grid.setChecked(True)
+        chk_grid.toggled.connect(lambda v: (setattr(self, "show_grid", v), self.update()))
+        lay.addWidget(chk_grid)
+
+        lay.addWidget(self._section("Canvas"))
+        self.canvas_label = QLabel("")
+        self.canvas_label.setObjectName("Hint")
+        lay.addWidget(self.canvas_label)
+        b_fit = QPushButton("Resize canvas to screen")
+        b_fit.clicked.connect(self.resize_to_screen)
+        lay.addWidget(b_fit)
+
+        lay.addWidget(self._section("Layers (images / GIFs)"))
+        self.layer_list = QListWidget()
+        self.layer_list.setIconSize(QSize(32, 32))
+        self.layer_list.setMaximumHeight(140)
+        self.layer_list.currentRowChanged.connect(self._on_layer_select)
+        lay.addWidget(self.layer_list)
+
+        row = QHBoxLayout()
+        b_layer_up = QPushButton("Up")
+        b_layer_up.clicked.connect(self.move_layer_up)
+        b_layer_down = QPushButton("Down")
+        b_layer_down.clicked.connect(self.move_layer_down)
+        b_layer_del = QPushButton("Delete")
+        b_layer_del.setObjectName("Danger")
+        b_layer_del.clicked.connect(self.delete_layer)
+        row.addWidget(b_layer_up)
+        row.addWidget(b_layer_down)
+        row.addWidget(b_layer_del)
+        lay.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Scale"))
+        self.layer_scale_spin = QSpinBox()
+        self.layer_scale_spin.setRange(5, 800)
+        self.layer_scale_spin.setValue(100)
+        self.layer_scale_spin.setSuffix(" %")
+        self.layer_scale_spin.valueChanged.connect(self._on_layer_scale)
+        row.addStretch(1)
+        row.addWidget(self.layer_scale_spin)
+        lay.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Opacity"))
+        self.layer_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.layer_opacity_slider.setRange(0, 255)
+        self.layer_opacity_slider.setValue(255)
+        self.layer_opacity_slider.valueChanged.connect(self._on_layer_opacity)
+        row.addWidget(self.layer_opacity_slider, 1)
+        lay.addLayout(row)
+
+        b_flatten = QPushButton("Flatten into canvas")
+        b_flatten.clicked.connect(self.flatten_layer)
+        lay.addWidget(b_flatten)
+        self._set_layer_controls_enabled(False)
+
+        row = QHBoxLayout()
+        b_undo = QPushButton("Undo")
+        b_undo.clicked.connect(self.undo)
+        b_redo = QPushButton("Redo")
+        b_redo.clicked.connect(self.redo)
+        row.addWidget(b_undo)
+        row.addWidget(b_redo)
+        lay.addLayout(row)
+
+        b_clear = QPushButton("Clear canvas")
+        b_clear.setObjectName("Danger")
+        b_clear.clicked.connect(self.clear)
+        lay.addWidget(b_clear)
+
+        hint = QLabel("Left click draws, right click erases.\n"
+                      "Wheel zooms at cursor, middle button pans.\n"
+                      "Ctrl+H hides panels, Ctrl+0 centers, Esc exits.\n"
+                      "Center means 1:1, exactly as it will appear in game.\n"
+                      "Import PNG/JPG/GIF/WebP: each import becomes its own "
+                      "layer. Pick the Move layer tool, click a layer to "
+                      "select it, drag to move, corner handle to resize. "
+                      "Scale/opacity stay editable any time - nothing is "
+                      "baked into the canvas unless you flatten it.")
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        lay.addStretch(1)
+        self._update_canvas_label()
+        return panel
+
+    @staticmethod
+    def _section(text):
+        lbl = QLabel(text)
+        lbl.setObjectName("Section")
+        return lbl
+
+    def _install_shortcuts(self):
+        for keys, fn in (("Ctrl+Z", self.undo), ("Ctrl+Shift+Z", self.redo),
+                         ("Ctrl+Y", self.redo), ("Ctrl+S", self.save),
+                         ("Esc", self.close), ("Ctrl+0", self.center_canvas),
+                         ("Ctrl+H", self.toggle_panels)):
+            sc = QShortcut(QKeySequence(keys), self)
+            sc.activated.connect(fn)
+
+    def toggle_panels(self):
+        visible = not self.top_panel.isVisible()
+        self.top_panel.setVisible(visible)
+        self.tools_panel.setVisible(visible)
+        self.status.setVisible(visible)
+        self.update()
+
+    def set_tool(self, key):
+        self.tool = key
+        for k, b in self.tool_buttons.items():
+            b.setChecked(k == key)
+
+    def _on_color(self, c):
+        self.color = QColor(c)
+
+    def _update_canvas_label(self):
+        sw, sh = screen_pixel_size(self.screen_index)
+        text = "%d x %d px" % (self.image.width(), self.image.height())
+        if (self.image.width(), self.image.height()) != (sw, sh):
+            text += "\nscreen is %d x %d" % (sw, sh)
+        self.canvas_label.setText(text)
+
+    def _dpr(self):
+        return self.devicePixelRatioF()
+
+    def _phys_size(self):
+        dpr = self._dpr()
+        return int(round(self.width() * dpr)), int(round(self.height() * dpr))
+
+    def center_canvas(self):
+        self.zoom = 1
+        self.zoom_spin.blockSignals(True)
+        self.zoom_spin.setValue(1)
+        self.zoom_spin.blockSignals(False)
+        w, h = self._phys_size()
+        self.ox = (w - self.image.width()) // 2
+        self.oy = (h - self.image.height()) // 2
+        self.update()
+
+    def _on_zoom_spin(self, v):
+        w, h = self._phys_size()
+        self._set_zoom(v, w // 2, h // 2)
+
+    def _set_zoom(self, new_zoom, ax, ay):
+        new_zoom = max(1, min(40, int(new_zoom)))
+        if new_zoom == self.zoom:
+            return
+        cx = (ax - self.ox) / self.zoom
+        cy = (ay - self.oy) / self.zoom
+        self.zoom = new_zoom
+        self.ox = int(round(ax - cx * new_zoom))
+        self.oy = int(round(ay - cy * new_zoom))
+        self.zoom_spin.blockSignals(True)
+        self.zoom_spin.setValue(new_zoom)
+        self.zoom_spin.blockSignals(False)
+        self.update()
+
+    def _to_canvas(self, pos):
+        dpr = self._dpr()
+        x = math.floor((pos.x() * dpr - self.ox) / self.zoom)
+        y = math.floor((pos.y() * dpr - self.oy) / self.zoom)
+        return QPoint(int(x), int(y))
+
+    def _in_canvas(self, p):
+        return 0 <= p.x() < self.image.width() and 0 <= p.y() < self.image.height()
+
+    def _push_undo(self):
+        self.undo_stack.append(image_to_png_bytes(self.image))
+        if len(self.undo_stack) > 40:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def undo(self):
+        if not self.undo_stack:
+            return
+        self.redo_stack.append(image_to_png_bytes(self.image))
+        self.image = image_from_png_bytes(self.undo_stack.pop())
+        self.preset.image = self.image
+        self.dirty = True
+        self._update_canvas_label()
+        self.update()
+
+    def redo(self):
+        if not self.redo_stack:
+            return
+        self.undo_stack.append(image_to_png_bytes(self.image))
+        self.image = image_from_png_bytes(self.redo_stack.pop())
+        self.preset.image = self.image
+        self.dirty = True
+        self._update_canvas_label()
+        self.update()
+
+    def clear(self):
+        self._push_undo()
+        self.image.fill(Qt.GlobalColor.transparent)
+        self.dirty = True
+        self.update()
+
+    def resize_to_screen(self):
+        sw, sh = screen_pixel_size(self.screen_index)
+        if (self.image.width(), self.image.height()) == (sw, sh):
+            return
+        self._push_undo()
+        dx = (sw - self.image.width()) // 2
+        dy = (sh - self.image.height()) // 2
+        img = blank_image(sw, sh)
+        p = QPainter(img)
+        p.drawImage(QPoint(dx, dy), self.image)
+        p.end()
+        self.image = img
+        self.preset.image = img
+        for layer in self.layers:
+            layer.pos = QPoint(layer.pos.x() + dx, layer.pos.y() + dy)
+        self.dirty = True
+        self._update_canvas_label()
+        self.center_canvas()
+
+    def _set_layer_controls_enabled(self, enabled):
+        for w in (self.layer_scale_spin, self.layer_opacity_slider):
+            w.setEnabled(enabled)
+
+    def refresh_layer_list(self, select_layer=None):
+        self.layer_list.blockSignals(True)
+        self.layer_list.clear()
+        for l in self.layers:
+            icon = QIcon(QPixmap.fromImage(l.base_frame()).scaled(
+                32, 32, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+            label = l.name + ("  (gif)" if l.is_animated else "")
+            self.layer_list.addItem(QListWidgetItem(icon, label))
+        self.layer_list.blockSignals(False)
+        target = select_layer if select_layer is not None else self.active_layer
+        row = self.layers.index(target) if target in self.layers else -1
+        if row < 0 and self.layers:
+            row = len(self.layers) - 1
+        if row >= 0:
+            self.layer_list.setCurrentRow(row)
+        else:
+            self.active_layer = None
+            self._set_layer_controls_enabled(False)
+
+    def _on_layer_select(self, row):
+        if 0 <= row < len(self.layers):
+            self.active_layer = self.layers[row]
+            self.layer_scale_spin.blockSignals(True)
+            self.layer_scale_spin.setValue(int(round(self.active_layer.scale * 100)))
+            self.layer_scale_spin.blockSignals(False)
+            self.layer_opacity_slider.blockSignals(True)
+            self.layer_opacity_slider.setValue(self.active_layer.opacity)
+            self.layer_opacity_slider.blockSignals(False)
+            self._set_layer_controls_enabled(True)
+        else:
+            self.active_layer = None
+            self._set_layer_controls_enabled(False)
+        self.update()
+
+    def _on_layer_scale(self, percent):
+        if self.active_layer is None:
+            return
+        self.active_layer.scale = max(0.01, percent / 100.0)
+        self.dirty = True
+        self.update()
+
+    def _on_layer_opacity(self, val):
+        if self.active_layer is None:
+            return
+        self.active_layer.opacity = val
+        self.dirty = True
+        self.update()
+
+    def move_layer_up(self):
+        l = self.active_layer
+        if l is None or l not in self.layers:
+            return
+        i = self.layers.index(l)
+        if i + 1 < len(self.layers):
+            self.layers[i], self.layers[i + 1] = self.layers[i + 1], self.layers[i]
+            self.dirty = True
+            self.refresh_layer_list(l)
+            self.update()
+
+    def move_layer_down(self):
+        l = self.active_layer
+        if l is None or l not in self.layers:
+            return
+        i = self.layers.index(l)
+        if i > 0:
+            self.layers[i - 1], self.layers[i] = self.layers[i], self.layers[i - 1]
+            self.dirty = True
+            self.refresh_layer_list(l)
+            self.update()
+
+    def delete_layer(self):
+        l = self.active_layer
+        if l is None or l not in self.layers:
+            return
+        self.layers.remove(l)
+        self.active_layer = None
+        self.dirty = True
+        self.refresh_layer_list()
+        self.update()
+
+    def flatten_layer(self):
+        l = self.active_layer
+        if l is None or l not in self.layers:
+            return
+        self._push_undo()
+        painter = QPainter(self.image)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setOpacity(l.opacity / 255.0)
+        painter.drawImage(l.pos, l.scaled_frame())
+        painter.end()
+        self.preset.image = self.image
+        self.layers.remove(l)
+        self.active_layer = None
+        self.dirty = True
+        self.refresh_layer_list()
+        self._update_canvas_label()
+        self.status.setText("Layer flattened onto the canvas.")
+        self.update()
+
+    def _layer_screen_rect(self, layer):
+        dpr = self._dpr()
+        f = layer.scaled_frame()
+        left = (self.ox + layer.pos.x() * self.zoom) / dpr
+        top = (self.oy + layer.pos.y() * self.zoom) / dpr
+        right = (self.ox + (layer.pos.x() + f.width()) * self.zoom) / dpr
+        bottom = (self.oy + (layer.pos.y() + f.height()) * self.zoom) / dpr
+        return left, top, right, bottom
+
+    def _layer_hit_test(self, pos):
+        tol = 9.0
+        for layer in reversed(self.layers):
+            left, top, right, bottom = self._layer_screen_rect(layer)
+            if abs(pos.x() - right) <= tol and abs(pos.y() - bottom) <= tol:
+                return layer, True
+            if left <= pos.x() <= right and top <= pos.y() <= bottom:
+                return layer, False
+        return None
+
+    def _stamp(self, painter, x, y, color):
+        w = self.thickness
+        painter.fillRect(x - (w - 1) // 2, y - (w - 1) // 2, w, w, color)
+
+    def _draw_points(self, points, erase=False):
+        painter = QPainter(self.image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        color = QColor(0, 0, 0, 0) if erase else self.color
+        for (x, y) in points:
+            self._stamp(painter, x, y, color)
+        painter.end()
+        self.preset.image = self.image
+        self.dirty = True
+        self.update()
+
+    def _flood_fill(self, sx, sy):
+        img = self.image
+        w, h = img.width(), img.height()
+        try:
+            ptr = img.bits()
+            ptr.setsize(img.sizeInBytes())
+            mv = memoryview(ptr).cast("I")
+        except Exception:
+            return
+        stride = img.bytesPerLine() // 4
+        target = mv[sy * stride + sx]
+        c = self.color
+        new = (c.alpha() << 24) | (c.red() << 16) | (c.green() << 8) | c.blue()
+        if target == new:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        stack = [(sx, sy)]
+        while stack:
+            x, y = stack.pop()
+            row = y * stride
+            if mv[row + x] != target:
+                continue
+            x0 = x
+            while x0 > 0 and mv[row + x0 - 1] == target:
+                x0 -= 1
+            x1 = x
+            while x1 < w - 1 and mv[row + x1 + 1] == target:
+                x1 += 1
+            for i in range(x0, x1 + 1):
+                mv[row + i] = new
+            for ny in (y - 1, y + 1):
+                if 0 <= ny < h:
+                    nrow = ny * stride
+                    i = x0
+                    while i <= x1:
+                        if mv[nrow + i] == target:
+                            stack.append((i, ny))
+                            while i <= x1 and mv[nrow + i] == target:
+                                i += 1
+                        i += 1
+        QApplication.restoreOverrideCursor()
+        self.preset.image = self.image
+        self.dirty = True
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.MiddleButton:
+            self.panning = True
+            self.pan_anchor = e.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+        if self.tool == "move":
+            if e.button() == Qt.MouseButton.LeftButton:
+                hit = self._layer_hit_test(e.position())
+                if hit is not None:
+                    layer, on_handle = hit
+                    if layer is not self.active_layer:
+                        self.active_layer = layer
+                        self.refresh_layer_list(layer)
+                    if on_handle:
+                        self.layer_resizing = True
+                        self.layer_resize_start = e.position()
+                        self.layer_resize_orig_scale = layer.scale
+                    else:
+                        self.layer_dragging = True
+                        self.layer_drag_anchor = e.position()
+                        self.layer_drag_orig_pos = QPoint(layer.pos)
+            return
+        p = self._to_canvas(e.position())
+        if not self._in_canvas(p):
+            return
+        erase = e.button() == Qt.MouseButton.RightButton or self.tool == "eraser"
+        if self.tool == "picker" and not erase:
+            self.picker.set_color(self.image.pixelColor(p))
+            return
+        self._push_undo()
+        if self.tool == "fill" and not erase:
+            self._flood_fill(p.x(), p.y())
+            return
+        self.drag_start = p
+        self.last_pt = p
+        if self.tool in ("line", "rect", "ellipse"):
+            self.snapshot = self.image.copy()
+        self._draw_points([(p.x(), p.y())], erase)
+
+    def mouseMoveEvent(self, e):
+        if self.panning:
+            dpr = self._dpr()
+            d = e.position() - self.pan_anchor
+            self.ox += int(round(d.x() * dpr))
+            self.oy += int(round(d.y() * dpr))
+            self.pan_anchor = e.position()
+            self.update()
+            return
+        if self.tool == "move":
+            dpr = self._dpr()
+            pos = e.position()
+            if self.layer_dragging and self.active_layer is not None:
+                dx = (pos.x() - self.layer_drag_anchor.x()) * dpr / self.zoom
+                dy = (pos.y() - self.layer_drag_anchor.y()) * dpr / self.zoom
+                self.active_layer.pos = QPoint(
+                    int(round(self.layer_drag_orig_pos.x() + dx)),
+                    int(round(self.layer_drag_orig_pos.y() + dy)))
+                self.dirty = True
+                self.update()
+            elif self.layer_resizing and self.active_layer is not None:
+                layer = self.active_layer
+                base = layer.base_frame()
+                delta = pos.x() - self.layer_resize_start.x()
+                orig_w_screen = base.width() * self.layer_resize_orig_scale * self.zoom / dpr
+                new_w_screen = max(6.0, orig_w_screen + delta)
+                new_scale = new_w_screen * dpr / (self.zoom * base.width())
+                new_scale = max(0.05, min(8.0, new_scale))
+                layer.scale = new_scale
+                self.dirty = True
+                self.layer_scale_spin.blockSignals(True)
+                self.layer_scale_spin.setValue(int(round(new_scale * 100)))
+                self.layer_scale_spin.blockSignals(False)
+                self.update()
+            else:
+                hit = self._layer_hit_test(pos)
+                if hit is not None:
+                    layer, on_handle = hit
+                    self.setCursor(Qt.CursorShape.SizeFDiagCursor if on_handle
+                                   else Qt.CursorShape.OpenHandCursor)
+                else:
+                    self.unsetCursor()
+            return
+        p = self._to_canvas(e.position())
+        self.hover = p if self._in_canvas(p) else None
+        if self.drag_start is None:
+            self._update_status(p)
+            self.update()
+            return
+        erase = bool(e.buttons() & Qt.MouseButton.RightButton) or self.tool == "eraser"
+        if self.tool in ("pencil", "eraser"):
+            pts = bresenham(self.last_pt.x(), self.last_pt.y(), p.x(), p.y())
+            self.last_pt = p
+            self._draw_points(pts, erase)
+        elif self.tool in ("line", "rect", "ellipse") and self.snapshot is not None:
+            self.image = self.snapshot.copy()
+            self.preset.image = self.image
+            if self.tool == "line":
+                pts = bresenham(self.drag_start.x(), self.drag_start.y(), p.x(), p.y())
+            elif self.tool == "rect":
+                pts = rect_points(self.drag_start.x(), self.drag_start.y(),
+                                  p.x(), p.y(), self.fill_shapes)
+            else:
+                pts = ellipse_points(self.drag_start.x(), self.drag_start.y(),
+                                     p.x(), p.y(), self.fill_shapes)
+            self._draw_points(pts, erase)
+        self._update_status(p)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.MiddleButton:
+            self.panning = False
+            self.unsetCursor()
+            return
+        if self.tool == "move":
+            self.layer_dragging = False
+            self.layer_resizing = False
+            return
+        self.drag_start = None
+        self.snapshot = None
+        self.last_pt = None
+
+    def wheelEvent(self, e):
+        pos = e.position().toPoint()
+        if self._over_chrome(pos):
+            self._forward_wheel_to_panel(e, pos)
+            return
+        dpr = self._dpr()
+        step = 1 if e.angleDelta().y() > 0 else -1
+        target = self.zoom + step if self.zoom < 8 else self.zoom + step * 2
+        self._set_zoom(target, int(pos.x() * dpr), int(pos.y() * dpr))
+
+    def _over_chrome(self, pos):
+        for panel in (self.top_panel, self.tools_panel):
+            if panel.isVisible() and panel.geometry().contains(pos):
+                return True
+        return False
+
+    def _forward_wheel_to_panel(self, e, pos):
+        child = self.childAt(pos)
+        if isinstance(child, QSlider):
+            return
+        panel = self.tools_panel if self.tools_panel.geometry().contains(pos) else self.top_panel
+        delta = 1 if e.angleDelta().y() > 0 else -1
+        best, best_dist = None, None
+        for sld in panel.findChildren(QSlider):
+            if not sld.isVisible():
+                continue
+            top_left = sld.mapTo(self, QPoint(0, 0))
+            center_y = top_left.y() + sld.height() // 2
+            dist = abs(center_y - pos.y())
+            if best_dist is None or dist < best_dist:
+                best_dist, best = dist, sld
+        if best is not None:
+            step = best.singleStep() or 1
+            best.setValue(max(best.minimum(), min(best.maximum(), best.value() + delta * step)))
+
+    def _update_status(self, p):
+        iw, ih = self.image.width(), self.image.height()
+        dx = p.x() - iw / 2.0
+        dy = p.y() - ih / 2.0
+        self.status.setText(
+            "canvas %d, %d    offset from screen center %+d, %+d    zoom %dx"
+            % (p.x(), p.y(), int(round(dx)), int(round(dy)), self.zoom))
+
+    def paintEvent(self, _):
+        dpr = self._dpr()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        p.fillRect(self.rect(), QColor(10, 15, 21, self.dim))
+        p.scale(1.0 / dpr, 1.0 / dpr)
+
+        w, h = self._phys_size()
+        z = self.zoom
+        iw, ih = self.image.width(), self.image.height()
+
+        x0 = max(0, math.floor((0 - self.ox) / z))
+        y0 = max(0, math.floor((0 - self.oy) / z))
+        x1 = min(iw - 1, math.floor((w - self.ox) / z))
+        y1 = min(ih - 1, math.floor((h - self.oy) / z))
+
+        p.setPen(QColor(61, 174, 233, 60))
+        cross_x = self.ox + (iw / 2.0) * z
+        cross_y = self.oy + (ih / 2.0) * z
+        p.drawLine(0, int(round(cross_y)), w, int(round(cross_y)))
+        p.drawLine(int(round(cross_x)), 0, int(round(cross_x)), h)
+
+        if x1 >= x0 and y1 >= y0:
+            src = QRect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+            dst = QRect(self.ox + x0 * z, self.oy + y0 * z, src.width() * z, src.height() * z)
+            p.drawImage(dst, self.image, src)
+
+            if self.show_grid and z >= 6:
+                p.setPen(QColor(255, 255, 255, 20))
+                for i in range(src.width() + 1):
+                    gx = dst.left() + i * z
+                    p.drawLine(gx, dst.top(), gx, dst.bottom())
+                for i in range(src.height() + 1):
+                    gy = dst.top() + i * z
+                    p.drawLine(dst.left(), gy, dst.right(), gy)
+
+        p.setPen(QColor(61, 174, 233, 120))
+        p.drawRect(QRect(self.ox - 1, self.oy - 1, iw * z + 1, ih * z + 1))
+
+        for layer in self.layers:
+            f = layer.scaled_frame()
+            dst = QRect(self.ox + layer.pos.x() * z, self.oy + layer.pos.y() * z,
+                       f.width() * z, f.height() * z)
+            p.setOpacity(layer.opacity / 255.0)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            p.drawImage(dst, f)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            p.setOpacity(1.0)
+
+        if (self.tool == "move" and self.active_layer is not None
+                and self.active_layer in self.layers):
+            layer = self.active_layer
+            f = layer.scaled_frame()
+            dst = QRect(self.ox + layer.pos.x() * z, self.oy + layer.pos.y() * z,
+                       f.width() * z, f.height() * z)
+            pen = QPen(QColor(255, 255, 255, 230))
+            pen.setStyle(Qt.PenStyle.DashLine)
+            pen.setWidth(1)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(dst)
+            hs = 9
+            p.setPen(QColor(20, 20, 20))
+            p.setBrush(QColor(255, 255, 255))
+            p.drawRect(dst.right() - hs // 2, dst.bottom() - hs // 2, hs, hs)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+
+        if self.hover is not None and self.tool != "move":
+            t = self.thickness
+            hx = self.ox + (self.hover.x() - (t - 1) // 2) * z
+            hy = self.oy + (self.hover.y() - (t - 1) // 2) * z
+            p.setPen(QColor(255, 255, 255, 190))
+            p.drawRect(hx, hy, t * z, t * z)
+
+        if not self.top_panel.isVisible():
+            p.setPen(QColor(125, 143, 163))
+            p.drawText(QRect(0, 16, w, 30), Qt.AlignmentFlag.AlignHCenter,
+                       "Ctrl+H to show panels")
+        p.end()
+
+    def _apply_name(self):
+        name = self.name_edit.text().strip() or "Untitled"
+        self.preset.name = name
+        return name
+
+    def save(self):
+        name = self._apply_name()
+        old = PRESETS_DIR / (safe_filename(self.orig_name) + ".json")
+        self.preset.save()
+        if safe_filename(name) != safe_filename(self.orig_name):
+            try:
+                old.unlink()
+            except FileNotFoundError:
+                pass
+        self.orig_name = name
+        self.dirty = False
+        self.status.setText("Saved to %s" % self.preset.path)
+        self.saved.emit(self.preset.copy())
+
+    def save_as(self):
+        name, ok = QInputDialog.getText(self, "Save as", "New preset name:")
+        if not ok or not name.strip():
+            return
+        self.name_edit.setText(name.strip())
+        self.preset.name = name.strip()
+        self.preset.save()
+        self.orig_name = name.strip()
+        self.dirty = False
+        self.status.setText("Saved to %s" % self.preset.path)
+        self.saved.emit(self.preset.copy())
+
+    def load_dialog(self):
+        presets = load_presets()
+        if not presets:
+            QMessageBox.information(self, "Load", "No saved presets yet.")
+            return
+        names = [p.name for p in presets]
+        name, ok = QInputDialog.getItem(self, "Load preset", "Preset:", names, 0, False)
+        if not ok:
+            return
+        chosen = presets[names.index(name)]
+        self._push_undo()
+        self.image = chosen.image.copy()
+        self.layers = [l.copy() for l in chosen.layers]
+        self.preset = Preset(chosen.name, image=self.image, layers=self.layers)
+        self.active_layer = None
+        self.name_edit.setText(chosen.name)
+        self.orig_name = chosen.name
+        self.dirty = False
+        self._update_canvas_label()
+        self.refresh_layer_list()
+        self.center_canvas()
+
+    def import_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import image", str(Path.home()),
+            "Images (*.png *.gif *.bmp *.webp *.jpg *.jpeg)")
+        if not path:
+            return
+        frames, delays = load_frames(path)
+        if not frames:
+            QMessageBox.warning(self, "Import", "Could not open that file.")
+            return
+        cw, ch = self.image.width(), self.image.height()
+        fw, fh = frames[0].width(), frames[0].height()
+        scale = 1.0
+        if fw > cw or fh > ch:
+            scale = min(cw / fw, ch / fh, 1.0)
+        base_name = Path(path).stem or "layer"
+        existing = {l.name for l in self.layers}
+        name, n = base_name, 2
+        while name in existing:
+            name = "%s %d" % (base_name, n)
+            n += 1
+        layer = Layer(name, frames, delays, scale=scale)
+        layer.pos = QPoint(int(round((cw - fw * scale) / 2)), int(round((ch - fh * scale) / 2)))
+        self.layers.append(layer)
+        self.active_layer = layer
+        self.dirty = True
+        self.set_tool("move")
+        self.refresh_layer_list(layer)
+        kind = ("animated GIF (%d frames)" % len(frames)) if layer.is_animated else "image"
+        self.status.setText("Imported %s as a new layer. Drag to move, "
+                            "corner handle to resize." % kind)
+        self.update()
+
+    def closeEvent(self, e):
+        if self.dirty:
+            res = QMessageBox.question(
+                self, "Close editor", "You have unsaved changes. Save them?",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel)
+            if res == QMessageBox.StandardButton.Cancel:
+                e.ignore()
+                return
+            if res == QMessageBox.StandardButton.Save:
+                self.save()
+        self.closed.emit()
+        e.accept()
+
+
+class PreviewBox(QFrame):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("Panel")
+        self.setMinimumHeight(240)
+        self.preset = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(60)
+        self._timer.timeout.connect(self._tick)
+
+    def set_preset(self, preset):
+        self.preset = preset
+        if preset is not None and any(l.is_animated for l in preset.layers):
+            self._timer.start()
+        else:
+            self._timer.stop()
+        self.update()
+
+    def _tick(self):
+        if self.preset is None:
+            return
+        changed = False
+        for layer in self.preset.layers:
+            if layer.advance(self._timer.interval()):
+                changed = True
+        if changed:
+            self.update()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self)
+        r = self.rect().adjusted(10, 10, -10, -10)
+        if self.preset is None:
+            p.setPen(QColor(125, 143, 163))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No preset selected")
+            p.end()
+            return
+        img = self.preset.composite_image()
+        scale = min(r.width() / img.width(), r.height() / img.height(), 1.0)
+        w = max(1, int(img.width() * scale))
+        h = max(1, int(img.height() * scale))
+        frame = QRect(r.center().x() - w // 2, r.center().y() - h // 2, w, h)
+        p.fillRect(frame, QColor(11, 17, 24))
+        p.setPen(QColor(61, 174, 233, 40))
+        p.drawLine(frame.left(), frame.center().y(), frame.right(), frame.center().y())
+        p.drawLine(frame.center().x(), frame.top(), frame.center().x(), frame.bottom())
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.drawImage(frame, img)
+        cr = self.preset.content_rect()
+        marker = QRect(frame.left() + int(cr.left() * scale) - 3,
+                       frame.top() + int(cr.top() * scale) - 3,
+                       max(int(cr.width() * scale) + 6, 8),
+                       max(int(cr.height() * scale) + 6, 8))
+        p.setPen(QColor(255, 120, 120, 150))
+        p.drawRect(marker)
+        p.setPen(QColor(43, 60, 78))
+        p.drawRect(frame)
+        p.setPen(QColor(125, 143, 163))
+        p.drawText(self.rect().adjusted(0, 0, -12, -6),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+                   "%d x %d" % (img.width(), img.height()))
+        p.end()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(make_app_icon())
+        self.resize(900, 620)
+        self.settings = load_settings()
+
+        self.presets = load_presets()
+        if not self.presets:
+            create_default_presets()
+            self.presets = load_presets()
+
+        self.overlay = Overlay(self.settings.get("bypass_wm", True))
+        self.editor = None
+        self.running = False
+        self._wayland_warned = False
+
+        self._build_ui()
+        self._build_tray()
+        self._select_last()
+
+    def _build_ui(self):
+        root = QWidget()
+        root.setObjectName("Root")
+        self.setCentralWidget(root)
+        lay = QHBoxLayout(root)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        side = QWidget()
+        side.setObjectName("Sidebar")
+        side.setFixedWidth(260)
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(14, 16, 14, 14)
+        sl.setSpacing(10)
+        head = QLabel("Presets")
+        head.setObjectName("Title")
+        sl.addWidget(head)
+        self.list = QListWidget()
+        self.list.setIconSize(QSize(44, 44))
+        self.list.currentRowChanged.connect(self._on_select)
+        self.list.itemDoubleClicked.connect(lambda _: self.open_editor())
+        sl.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        b_new = QPushButton("New")
+        b_new.clicked.connect(self.new_preset)
+        b_dup = QPushButton("Duplicate")
+        b_dup.clicked.connect(self.duplicate_preset)
+        row.addWidget(b_new)
+        row.addWidget(b_dup)
+        sl.addLayout(row)
+        row = QHBoxLayout()
+        b_ren = QPushButton("Rename")
+        b_ren.clicked.connect(self.rename_preset)
+        b_del = QPushButton("Delete")
+        b_del.setObjectName("Danger")
+        b_del.clicked.connect(self.delete_preset)
+        row.addWidget(b_ren)
+        row.addWidget(b_del)
+        sl.addLayout(row)
+        lay.addWidget(side)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(20, 18, 20, 18)
+        rl.setSpacing(14)
+
+        self.title = QLabel("-")
+        self.title.setObjectName("Title")
+        rl.addWidget(self.title)
+
+        self.preview = PreviewBox()
+        rl.addWidget(self.preview, 1)
+
+        btns = QHBoxLayout()
+        self.btn_run = QPushButton("Start crosshair")
+        self.btn_run.setObjectName("Primary")
+        self.btn_run.clicked.connect(self.toggle_overlay)
+        b_edit = QPushButton("Editor")
+        b_edit.clicked.connect(self.open_editor)
+        btns.addWidget(self.btn_run, 2)
+        btns.addWidget(b_edit, 1)
+        rl.addLayout(btns)
+
+        opts = QFrame()
+        opts.setObjectName("Panel")
+        ol = QVBoxLayout(opts)
+        ol.setContentsMargins(14, 12, 14, 12)
+        ol.setSpacing(8)
+
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("Monitor"))
+        self.screen_combo = QComboBox()
+        for i, s in enumerate(QGuiApplication.screens()):
+            g = s.geometry()
+            self.screen_combo.addItem("%d - %s (%d x %d)" % (i + 1, s.name(), g.width(), g.height()), i)
+        self.screen_combo.setCurrentIndex(min(self.settings.get("screen", 0),
+                                              max(self.screen_combo.count() - 1, 0)))
+        self.screen_combo.currentIndexChanged.connect(self._on_screen)
+        srow.addStretch(1)
+        srow.addWidget(self.screen_combo)
+        ol.addLayout(srow)
+
+        self.chk_autostart = QCheckBox("Launch CrosshairX at login")
+        self.chk_autostart.setChecked(self.settings.get("autostart", False))
+        self.chk_autostart.toggled.connect(self._on_autostart)
+        ol.addWidget(self.chk_autostart)
+
+        self.chk_start = QCheckBox("Turn the crosshair on at startup")
+        self.chk_start.setChecked(self.settings.get("start_overlay", False))
+        self.chk_start.toggled.connect(self._on_start_overlay)
+        ol.addWidget(self.chk_start)
+
+        hint = QLabel("Presets live in %s and survive a reboot." % PRESETS_DIR)
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        ol.addWidget(hint)
+        rl.addWidget(opts)
+        lay.addWidget(right, 1)
+
+        self.setStyleSheet(QSS)
+        self.refresh_list()
+
+    def _build_tray(self):
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(make_app_icon(), self)
+        menu = QMenu()
+        act_show = QAction("Open window", self)
+        act_show.triggered.connect(self._restore)
+        act_toggle = QAction("Toggle crosshair", self)
+        act_toggle.triggered.connect(self.toggle_overlay)
+        act_quit = QAction("Quit", self)
+        act_quit.triggered.connect(self.quit_app)
+        menu.addAction(act_show)
+        menu.addAction(act_toggle)
+        menu.addSeparator()
+        menu.addAction(act_quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda r: self._restore() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray.setToolTip(APP_NAME)
+        self.tray.show()
+
+    def _restore(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def refresh_list(self, select_name=None):
+        current = select_name or (self.current_preset().name if self.current_preset() else None)
+        self.list.blockSignals(True)
+        self.list.clear()
+        for p in self.presets:
+            self.list.addItem(QListWidgetItem(QIcon(p.thumbnail()), p.name))
+        self.list.blockSignals(False)
+        row = 0
+        if current:
+            for i, p in enumerate(self.presets):
+                if p.name == current:
+                    row = i
+                    break
+        if self.presets:
+            self.list.setCurrentRow(row)
+            self._on_select(row)
+
+    def current_preset(self):
+        i = self.list.currentRow()
+        if 0 <= i < len(self.presets):
+            return self.presets[i]
+        return None
+
+    def _on_select(self, _):
+        p = self.current_preset()
+        self.title.setText(p.name if p else "-")
+        self.preview.set_preset(p)
+        if p:
+            self.settings["last_preset"] = p.name
+            save_settings(self.settings)
+            if self.running:
+                self.overlay.show_preset(p, self.screen_combo.currentIndex())
+
+    def _select_last(self):
+        name = self.settings.get("last_preset")
+        if name:
+            for i, p in enumerate(self.presets):
+                if p.name == name:
+                    self.list.setCurrentRow(i)
+                    return
+        if self.presets:
+            self.list.setCurrentRow(0)
+
+    def new_preset(self):
+        name, ok = QInputDialog.getText(self, "New preset", "Name:")
+        if not ok or not name.strip():
+            return
+        w, h = screen_pixel_size(self.screen_combo.currentIndex())
+        p = Preset(name.strip(), width=w, height=h)
+        p.save()
+        self.presets = load_presets()
+        self.refresh_list(p.name)
+        self.open_editor()
+
+    def duplicate_preset(self):
+        src = self.current_preset()
+        if not src:
+            return
+        name, ok = QInputDialog.getText(self, "Duplicate preset", "Name:", text=src.name + " copy")
+        if not ok or not name.strip():
+            return
+        p = Preset(name.strip(), image=src.image.copy())
+        p.save()
+        self.presets = load_presets()
+        self.refresh_list(p.name)
+
+    def rename_preset(self):
+        p = self.current_preset()
+        if not p:
+            return
+        name, ok = QInputDialog.getText(self, "Rename preset", "New name:", text=p.name)
+        if not ok or not name.strip():
+            return
+        p.delete_file()
+        p.name = name.strip()
+        p.save()
+        self.presets = load_presets()
+        self.refresh_list(p.name)
+
+    def delete_preset(self):
+        p = self.current_preset()
+        if not p:
+            return
+        if QMessageBox.question(self, "Delete preset",
+                                "Delete preset '%s'?" % p.name) != QMessageBox.StandardButton.Yes:
+            return
+        p.delete_file()
+        self.presets = load_presets()
+        if self.running and not self.presets:
+            self.toggle_overlay()
+        self.refresh_list()
+
+    def toggle_overlay(self):
+        p = self.current_preset()
+        if self.running:
+            self.overlay.stop()
+            self.running = False
+            self.btn_run.setText("Start crosshair")
+        elif p:
+            if not self.overlay._is_x11 and not self._wayland_warned:
+                self._wayland_warned = True
+                QMessageBox.information(
+                    self, "Wayland session detected",
+                    "This session is running under Wayland (%s).\n\n"
+                    "On Wayland there is no equivalent of X11's window-manager "
+                    "bypass hint, so a true exclusive fullscreen game (not "
+                    "borderless/windowed) will still cover the overlay "
+                    "completely - this is a compositor limitation, not a bug "
+                    "in this app.\n\n"
+                    "For the overlay to work over fullscreen games, either:\n"
+                    "  - set the game to Borderless / Windowed Fullscreen, or\n"
+                    "  - log out and choose the 'Plasma (X11)' session at the "
+                    "login screen, where the bypass hint works."
+                    % self.overlay._platform)
+            self.overlay.show_preset(p, self.screen_combo.currentIndex())
+            self.running = True
+            self.btn_run.setText("Stop crosshair")
+
+    def open_editor(self):
+        p = self.current_preset()
+        if not p:
+            QMessageBox.information(self, "Editor", "Create a preset first.")
+            return
+        was_running = self.running
+        if was_running:
+            self.toggle_overlay()
+        self.editor = Editor(p, self.screen_combo.currentIndex())
+        self.editor.saved.connect(self._on_editor_saved)
+        self.editor.closed.connect(lambda: self._on_editor_closed(was_running))
+        self.editor.showFullScreen()
+
+    def _on_editor_saved(self, preset):
+        self.presets = load_presets()
+        self.refresh_list(preset.name)
+
+    def _on_editor_closed(self, restart):
+        self.editor = None
+        self.presets = load_presets()
+        self.refresh_list()
+        if restart:
+            self.toggle_overlay()
+
+    def _on_screen(self, idx):
+        self.settings["screen"] = idx
+        save_settings(self.settings)
+        if self.running:
+            self.overlay.show_preset(self.current_preset(), idx)
+
+    def _on_autostart(self, v):
+        self.settings["autostart"] = v
+        save_settings(self.settings)
+        set_autostart(v)
+
+    def _on_start_overlay(self, v):
+        self.settings["start_overlay"] = v
+        save_settings(self.settings)
+
+    def quit_app(self):
+        self.overlay.stop()
+        if self.tray:
+            self.tray.hide()
+        QApplication.quit()
+
+    def closeEvent(self, e):
+        if self.tray is not None:
+            e.ignore()
+            self.hide()
+            self.tray.showMessage(APP_NAME, "Minimized to tray. The crosshair keeps running.",
+                                  QSystemTrayIcon.MessageIcon.Information, 2500)
+        else:
+            self.quit_app()
+            e.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    app.setWindowIcon(make_app_icon())
+    app.setQuitOnLastWindowClosed(False)
+    app.setStyleSheet(QSS)
+
+    win = MainWindow()
+    args = sys.argv[1:]
+    if "--start" in args or win.settings.get("start_overlay"):
+        win.toggle_overlay()
+    if not ("--tray" in args and win.tray is not None):
+        win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
+
